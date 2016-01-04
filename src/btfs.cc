@@ -1,5 +1,6 @@
 /*
 Copyright 2015 Johan Gunnarsson <johan.gunnarsson@gmail.com>
+          2016 Nils Schneider <nils@nilsschneider.net>
 
 This file is part of BTFS.
 
@@ -34,17 +35,14 @@ along with BTFS.  If not, see <http://www.gnu.org/licenses/>.
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/magnet_uri.hpp>
 
-#include <curl/curl.h>
-
 #include "btfs.h"
+#include "torrent.h"
 
 #define RETV(s, v) { s; return v; };
 
 using namespace btfs;
 
 libtorrent::session *session = NULL;
-
-libtorrent::torrent_handle handle;
 
 pthread_t alert_thread;
 
@@ -62,7 +60,7 @@ pthread_cond_t signal_cond = PTHREAD_COND_INITIALIZER;
 static struct btfs_params params;
 
 static bool
-move_to_next_unfinished(int& piece) {
+move_to_next_unfinished(libtorrent::torrent_handle &handle, int& piece) {
 	for (; piece < handle.get_torrent_info().num_pieces(); piece++) {
 		if (!handle.have_piece(piece))
 			return true;
@@ -72,10 +70,10 @@ move_to_next_unfinished(int& piece) {
 }
 
 static void
-jump(int piece, int size) {
+jump(libtorrent::torrent_handle &handle, int piece, int size) {
 	int tail = piece;
 
-	if (!move_to_next_unfinished(tail))
+	if (!move_to_next_unfinished(handle, tail))
 		return;
 
 	cursor = tail;
@@ -92,11 +90,13 @@ jump(int piece, int size) {
 }
 
 static void
-advance() {
-	jump(cursor, 0);
+advance(libtorrent::torrent_handle &handle) {
+	jump(handle, cursor, 0);
 }
 
-Read::Read(char *buf, int index, int offset, int size) {
+Read::Read(libtorrent::torrent_handle &h, char *buf, int index, int offset, int size) {
+  handle = h;
+
 	libtorrent::torrent_info metadata = handle.get_torrent_info();
 
 	libtorrent::file_entry file = metadata.file_at(index);
@@ -159,7 +159,7 @@ int Read::read() {
 	trigger();
 
 	// Move sliding window to first piece to serve this request
-	jump(parts.front().part.piece, size());
+	jump(handle, parts.front().part.piece, size());
 
 	while (!finished())
 		// Wait for any piece to downloaded
@@ -168,14 +168,69 @@ int Read::read() {
 	return size();
 }
 
+static bool
+populate_target(libtorrent::add_torrent_params& p, char *arg) {
+	std::string templ;
+
+	if (arg) {
+		templ += arg;
+	} else if (getenv("HOME")) {
+		templ += getenv("HOME");
+		templ += "/btfs";
+	} else {
+		templ += "/tmp/btfs";
+	}
+
+	if (mkdir(templ.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) < 0) {
+		if (errno != EEXIST)
+			RETV(fprintf(stderr, "Failed to create target: %m\n"),
+				false);
+	}
+
+	templ += "/btfs-XXXXXX";
+
+	char *s = strdup(templ.c_str());
+
+	if (mkdtemp(s) != NULL) {
+		char *x = realpath(s, NULL);
+
+		if (x)
+			p.save_path = x;
+		else
+			perror("Failed to expand target");
+
+		free(x);
+	} else {
+		perror("Failed to generate target");
+	}
+
+	free(s);
+
+	return p.save_path.length() > 0;
+}
+
 static void
-setup() {
+add_info_hash(libtorrent::sha1_hash &hash) {
+  printf("adding info hash %s\n", libtorrent::to_hex(hash.to_string()).c_str());
+	libtorrent::add_torrent_params p;
+
+  populate_target(p, NULL);
+
+	p.flags &= ~libtorrent::add_torrent_params::flag_auto_managed;
+	p.flags &= ~libtorrent::add_torrent_params::flag_paused;
+
+  p.info_hash = hash;
+
+	session->async_add_torrent(p);
+}
+
+static void
+setup(libtorrent::torrent_handle &handle) {
 	printf("Got metadata. Now ready to start downloading.\n");
 
 	libtorrent::torrent_info ti = handle.get_torrent_info();
 
-	if (params.browse_only)
-		handle.pause();
+  std::string info_hash = libtorrent::to_hex(handle.info_hash().to_string());
 
 	for (int i = 0; i < ti.num_files(); ++i) {
 		// Initially, don't download anything
@@ -191,10 +246,10 @@ setup() {
 
 			if (parent.length() <= 0)
 				// Root dir <-> children mapping
-				dirs["/"].insert(x);
+				dirs["/" + info_hash].insert(x);
 			else
 				// Non-root dir <-> children mapping
-		 		dirs[parent].insert(x);
+		 		dirs["/" + info_hash + parent].insert(x);
 
 			parent += "/";
 			parent += x;
@@ -203,7 +258,7 @@ setup() {
 		free(p);
 
 		// Path <-> file index mapping
-		files["/" + ti.file_at(i).path] = i;
+		files["/" + info_hash + "/" + ti.file_at(i).path] = i;
 	}
 }
 
@@ -234,7 +289,7 @@ handle_piece_finished_alert(libtorrent::piece_finished_alert *a) {
 	}
 
 	// Advance sliding window
-	advance();
+	advance(a->handle);
 
 	pthread_mutex_unlock(&lock);
 }
@@ -250,10 +305,8 @@ handle_torrent_added_alert(libtorrent::torrent_added_alert *a) {
 
 	pthread_mutex_lock(&lock);
 
-	handle = a->handle;
-
 	if (a->handle.status(0).has_metadata)
-		setup();
+		setup(a->handle);
 
 	pthread_mutex_unlock(&lock);
 }
@@ -264,9 +317,7 @@ handle_metadata_received_alert(libtorrent::metadata_received_alert *a) {
 
 	pthread_mutex_lock(&lock);
 
-	handle = a->handle;
-
-	setup();
+	setup(a->handle);
 
 	pthread_mutex_unlock(&lock);
 }
@@ -335,27 +386,61 @@ is_file(const char *path) {
 
 static int
 btfs_getattr(const char *path, struct stat *stbuf) {
-	if (!is_dir(path) && !is_file(path) && strcmp(path, "/") != 0)
-		return -ENOENT;
+  char *pathdup = strdupa(path);
+  char *saveptr;
+  char *info_hash_str = strtok_r(pathdup, "/", &saveptr);
 
-	pthread_mutex_lock(&lock);
+  memset(stbuf, 0, sizeof (*stbuf));
 
-	memset(stbuf, 0, sizeof (*stbuf));
+  stbuf->st_uid = getuid();
+  stbuf->st_gid = getgid();
 
-	stbuf->st_uid = getuid();
-	stbuf->st_gid = getgid();
+  if (info_hash_str != NULL) {
+    pathdup = strdupa(path);
+    char *remainder = strchr(pathdup + 1, '/');
 
-	if (strcmp(path, "/") == 0 || is_dir(path)) {
-		stbuf->st_mode = S_IFDIR | 0755;
-	} else {
-		libtorrent::file_entry file =
-			handle.get_torrent_info().file_at(files[path]);
+    if (strlen(info_hash_str) != 40)
+      return -ENOENT;
 
-		stbuf->st_mode = S_IFREG | 0444;
-		stbuf->st_size = file.size;
-	}
+    if (strspn(info_hash_str, "0123456789abcdef") != 40)
+      return -ENOENT;
 
-	pthread_mutex_unlock(&lock);
+    char sha1[20];
+    libtorrent::from_hex(info_hash_str, 40, sha1);
+    libtorrent::sha1_hash info_hash(sha1);
+
+    libtorrent::torrent_handle torrent = session->find_torrent(info_hash);
+
+    if (!torrent.is_valid())
+      add_info_hash(info_hash);
+
+    if (remainder == NULL)
+      stbuf->st_mode = S_IFDIR | 0755;
+    else {
+      if (!torrent.is_valid())
+        return -ENOENT;
+
+      // info_hash auswerten um torrent zu finden
+      if (!is_dir(path) && !is_file(path))
+        return -ENOENT;
+
+      pthread_mutex_lock(&lock);
+
+      if (is_dir(path)) {
+        stbuf->st_mode = S_IFDIR | 0755;
+      } else {
+        libtorrent::file_entry file =
+          torrent.get_torrent_info().file_at(files[path]);
+
+        stbuf->st_mode = S_IFREG | 0444;
+        stbuf->st_size = file.size;
+      }
+
+      pthread_mutex_unlock(&lock);
+    }
+  } else {
+    stbuf->st_mode = S_IFDIR | 0755;
+  }
 
 	return 0;
 }
@@ -363,23 +448,49 @@ btfs_getattr(const char *path, struct stat *stbuf) {
 static int
 btfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		off_t offset, struct fuse_file_info *fi) {
-	if (!is_dir(path) && !is_file(path) && strcmp(path, "/") != 0)
-		return -ENOENT;
+  // /info_hash/$foo
+  // /info_hash muss 40 zeichen hex haben
+  // from_hex() aufrufen
+  // sha1_assign() aufrufen
+  // schauen ob find_torrents ihn kennt, sonst hinzufügen
+  //
+  char *pathdup = strdupa(path);
+  char *saveptr;
+  char *info_hash_str = strtok_r(pathdup, "/", &saveptr);
 
-	if (is_file(path))
-		return -ENOTDIR;
+  filler(buf, ".", NULL, 0);
+  filler(buf, "..", NULL, 0);
 
-	pthread_mutex_lock(&lock);
+  if (info_hash_str != NULL) {
+    pathdup = strdupa(path);
+    char *remainder = strchr(pathdup + 1, '/');
 
-	filler(buf, ".", NULL, 0);
-	filler(buf, "..", NULL, 0);
+    if (strlen(info_hash_str) != 40)
+      return -ENOENT;
 
-	for (std::set<std::string>::iterator i = dirs[path].begin();
-			i != dirs[path].end(); ++i) {
-		filler(buf, i->c_str(), NULL, 0);
-	}
+    if (strspn(info_hash_str, "0123456789abcdef") != 40)
+      return -ENOENT;
 
-	pthread_mutex_unlock(&lock);
+    if (remainder != NULL) {
+      if (!is_dir(path))
+        return -ENOENT;
+
+      if (is_file(path))
+        return -ENOTDIR;
+    }
+
+    pthread_mutex_lock(&lock);
+
+    for (std::set<std::string>::iterator i = dirs[path].begin(); i != dirs[path].end(); ++i) {
+      filler(buf, i->c_str(), NULL, 0);
+    }
+
+    pthread_mutex_unlock(&lock);
+  } else {
+    std::vector<libtorrent::torrent_handle> torrents = session->get_torrents();
+    for (std::vector<libtorrent::torrent_handle>::iterator i = torrents.begin(); i != torrents.end(); ++i)
+      filler(buf, libtorrent::to_hex(i->info_hash().to_string()).c_str(), NULL, 0);
+  }
 
 	return 0;
 }
@@ -409,12 +520,31 @@ btfs_read(const char *path, char *buf, size_t size, off_t offset,
 	if (is_dir(path))
 		return -EISDIR;
 
-	if (params.browse_only)
-		return -EACCES;
-
 	pthread_mutex_lock(&lock);
 
-	Read *r = new Read(buf, files[path], offset, size);
+  char *pathdup = strdupa(path);
+  char *saveptr;
+  char *info_hash_str = strtok_r(pathdup, "/", &saveptr);
+
+  if (info_hash_str == NULL)
+    return -ENOENT;
+
+  if (strlen(info_hash_str) != 40)
+    return -ENOENT;
+
+  if (strspn(info_hash_str, "0123456789abcdef") != 40)
+    return -ENOENT;
+
+  char sha1[20];
+  libtorrent::from_hex(info_hash_str, 40, sha1);
+  libtorrent::sha1_hash info_hash(sha1);
+
+  libtorrent::torrent_handle handle = session->find_torrent(info_hash);
+
+  if (!handle.is_valid())
+    return -ENOENT;
+
+	Read *r = new Read(handle, buf, files[path], offset, size);
 
 	reads.push_back(r);
 
@@ -452,9 +582,15 @@ btfs_init(struct fuse_conn_info *conn) {
 			0,
 			0),
 		std::make_pair(6881, 6889),
-		"0.0.0.0",
+		NULL,
 		libtorrent::session::add_default_plugins,
 		alerts);
+
+  session->start_dht();
+  session->start_lsd();
+
+  session->add_dht_router(std::make_pair("router.bittorrent.com", 6881));
+  session->add_dht_router(std::make_pair("router.utorrent.com", 6881));
 
 	pthread_create(&alert_thread, NULL, alert_queue_loop, NULL);
 
@@ -469,7 +605,6 @@ btfs_init(struct fuse_conn_info *conn) {
 	se.announce_to_all_tiers = true;
 
 	session->set_settings(se);
-	session->async_add_torrent(*p);
 
 	pthread_mutex_unlock(&lock);
 
@@ -483,57 +618,15 @@ btfs_destroy(void *user_data) {
 	pthread_cancel(alert_thread);
 	pthread_join(alert_thread, NULL);
 
-	std::string path = handle.save_path();
-
-	session->remove_torrent(handle,
-		params.keep ? 0 : libtorrent::session::delete_files);
+  std::vector<libtorrent::torrent_handle> torrents = session->get_torrents();
+  for (std::vector<libtorrent::torrent_handle>::iterator i = torrents.begin(); i != torrents.end(); ++i) {
+  	session->remove_torrent(*i, params.keep ? 0 : libtorrent::session::delete_files);
+	  rmdir(i->save_path().c_str());
+  }
 
 	delete session;
 
-	rmdir(path.c_str());
-
 	pthread_mutex_unlock(&lock);
-}
-
-static bool
-populate_target(libtorrent::add_torrent_params& p, char *arg) {
-	std::string templ;
-
-	if (arg) {
-		templ += arg;
-	} else if (getenv("HOME")) {
-		templ += getenv("HOME");
-		templ += "/btfs";
-	} else {
-		templ += "/tmp/btfs";
-	}
-
-	if (mkdir(templ.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) < 0) {
-		if (errno != EEXIST)
-			RETV(fprintf(stderr, "Failed to create target: %m\n"),
-				false);
-	}
-
-	templ += "/btfs-XXXXXX";
-
-	char *s = strdup(templ.c_str());
-
-	if (mkdtemp(s) != NULL) {
-		char *x = realpath(s, NULL);
-
-		if (x)
-			p.save_path = x;
-		else
-			perror("Failed to expand target");
-
-		free(x);		
-	} else {
-		perror("Failed to generate target");
-	}
-
-	free(s);
-
-	return p.save_path.length() > 0;
 }
 
 static size_t
@@ -551,72 +644,6 @@ handle_http(void *contents, size_t size, size_t nmemb, void *userp) {
 	return nmemb * size;
 }
 
-static bool
-populate_metadata(libtorrent::add_torrent_params& p, const char *arg) {
-	std::string uri(arg);
-
-	if (uri.find("http:") == 0 || uri.find("https:") == 0) {
-		Array output;
-
-		CURL *ch = curl_easy_init();
-
-		curl_easy_setopt(ch, CURLOPT_URL, uri.c_str());
-		curl_easy_setopt(ch, CURLOPT_WRITEFUNCTION, handle_http); 
-		curl_easy_setopt(ch, CURLOPT_WRITEDATA, (void *) &output); 
-		curl_easy_setopt(ch, CURLOPT_USERAGENT, "btfs/" VERSION);
-		curl_easy_setopt(ch, CURLOPT_FOLLOWLOCATION, 1);
-
-		CURLcode res = curl_easy_perform(ch);
-
-		if(res != CURLE_OK)
-			RETV(fprintf(stderr, "curl failed: %s\n",
-				curl_easy_strerror(res)), false);
-
-		curl_easy_cleanup(ch);
-
-		libtorrent::error_code ec;
-
-		p.ti = new libtorrent::torrent_info((const char *) output.buf,
-			output.size, ec);
-
-		if (ec)
-			RETV(fprintf(stderr, "Can't load metadata: %s\n",
-				ec.message().c_str()), false);
-
-		if (params.browse_only)
-			p.flags |= libtorrent::add_torrent_params::flag_paused;
-	} else if (uri.find("magnet:") == 0) {
-		libtorrent::error_code ec;
-
-		parse_magnet_uri(uri, p, ec);
-
-		if (ec)
-			RETV(fprintf(stderr, "Can't load magnet: %s\n",
-				ec.message().c_str()), false);
-	} else {
-		char *r = realpath(uri.c_str(), NULL);
-
-		if (!r)
-			RETV(fprintf(stderr, "Can't find metadata: %m\n"),
-				false);
-
-		libtorrent::error_code ec;
-
-		p.ti = new libtorrent::torrent_info(r, ec);
-
-		free(r);
-
-		if (ec)
-			RETV(fprintf(stderr, "Can't load metadata: %s\n",
-				ec.message().c_str()), false);
-
-		if (params.browse_only)
-			p.flags |= libtorrent::add_torrent_params::flag_paused;
-	}
-
-	return true;
-}
-
 #define BTFS_OPT(t, p, v) { t, offsetof(struct btfs_params, p), v }
 
 static const struct fuse_opt btfs_opts[] = {
@@ -624,30 +651,10 @@ static const struct fuse_opt btfs_opts[] = {
 	BTFS_OPT("--version",     version,     1),
 	BTFS_OPT("-h",            help,        1),
 	BTFS_OPT("--help",        help,        1),
-	BTFS_OPT("-b",            browse_only, 1),
-	BTFS_OPT("--browse-only", browse_only, 1),
 	BTFS_OPT("-k",            keep,        1),
 	BTFS_OPT("--keep",        keep,        1),
 	FUSE_OPT_END
 };
-
-static int
-btfs_process_arg(void *data, const char *arg, int key,
-		struct fuse_args *outargs) {
-	// Number of NONOPT options so far
-	static int n = 0;
-
-	struct btfs_params *params = (struct btfs_params *) data;
-
-	if (key == FUSE_OPT_KEY_NONOPT) {
-		if (n++ == 0)
-			params->metadata = arg;
-
-		return n <= 1 ? 0 : 1;
-	}
-
-	return 1;
-}
 
 int
 main(int argc, char *argv[]) {
@@ -663,11 +670,8 @@ main(int argc, char *argv[]) {
 
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 
-	if (fuse_opt_parse(&args, &params, btfs_opts, btfs_process_arg))
+	if (fuse_opt_parse(&args, &params, btfs_opts, NULL))
 		RETV(fprintf(stderr, "Failed to parse options\n"), -1);
-
-	if (!params.metadata)
-		params.help = 1;
 
 	if (params.version) {
 		// Print version
@@ -682,12 +686,11 @@ main(int argc, char *argv[]) {
 
 	if (params.help) {
 		// Print usage
-		printf("usage: " PACKAGE " [options] metadata mountpoint\n");
+		printf("usage: " PACKAGE " [options] mountpoint\n");
 		printf("\n");
 		printf("btfs options:\n");
 		printf("    --version -v           show version information\n");
 		printf("    --help -h              show this message\n");
-		printf("    --browse-only -b       download metadata only\n");
 		printf("    --keep -k              keep files after unmount\n");
 		printf("\n");
 
@@ -698,22 +701,7 @@ main(int argc, char *argv[]) {
 		return 0;
 	}
 
-	libtorrent::add_torrent_params p;
-
-	p.flags &= ~libtorrent::add_torrent_params::flag_auto_managed;
-	p.flags &= ~libtorrent::add_torrent_params::flag_paused;
-
-	if (!populate_target(p, NULL))
-		return -1;
-
-	curl_global_init(CURL_GLOBAL_ALL);
-
-	if (!populate_metadata(p, params.metadata))
-		return -1;
-
-	fuse_main(args.argc, args.argv, &btfs_ops, (void *) &p);
-
-	curl_global_cleanup();
+	fuse_main(args.argc, args.argv, &btfs_ops, NULL);
 
 	return 0;
 }

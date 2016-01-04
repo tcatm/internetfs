@@ -51,7 +51,7 @@ private:
 class Read
 {
 public:
-	Read(char *buf, int index, int offset, int size);
+	Read(libtorrent::torrent_handle &handle, char *buf, int index, int offset, int size);
 
 	void copy(int piece, char *buffer, int size);
 
@@ -64,6 +64,7 @@ public:
 	int read();
 
 private:
+	libtorrent::torrent_handle handle;
 	std::vector<Part> parts;
 };
 
